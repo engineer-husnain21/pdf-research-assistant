@@ -23,7 +23,7 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 EMBED_BATCH_SIZE = 50
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
-DEFAULT_CHAT_MODEL = "gemini-2.5-flash"
+DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
 TOP_K = 4
 MAX_HISTORY_MESSAGES = 8
 FALLBACK_ANSWER = (
@@ -175,6 +175,9 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             "You are a careful research assistant. Answer the question using ONLY "
             "the context below, which comes from the user's PDF documents. "
+            "Start directly with the answer. Never begin with phrases like "
+            "'Based on the provided documents', 'According to the context' or "
+            "'The documents state'. Do not mention the context or documents at all. "
             "Be clear and concise, and use short bullet points when helpful. "
             "If the context does not contain the answer, reply with exactly this "
             f"sentence and nothing else: {FALLBACK_ANSWER}\n\n"
