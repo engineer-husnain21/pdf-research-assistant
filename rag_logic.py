@@ -276,3 +276,13 @@ def answer_question(question: str, chat_history: list[dict] | None = None) -> di
         "sources": format_sources(docs) if found else [],
         "found": found,
     }
+
+
+def list_ingested_documents() -> dict[str, int]:
+    """Return {file name: chunk count} for everything stored in ChromaDB."""
+    data = get_vector_store().get(include=["metadatas"])
+    counts: dict[str, int] = {}
+    for meta in data["metadatas"] or []:
+        name = (meta or {}).get("source", "Unknown")
+        counts[name] = counts.get(name, 0) + 1
+    return counts
