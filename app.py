@@ -13,6 +13,7 @@ from rag_logic import (
     get_api_key,
     ingest_pdf,
     list_ingested_documents,
+    set_runtime_api_key,
 )
 
 st.set_page_config(
@@ -125,6 +126,12 @@ EXAMPLE_PROMPTS = [
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "user_api_key" not in st.session_state:
+    st.session_state.user_api_key = None
+
+# Apply the visitor's own key (if any) on every rerun, before anything uses the API.
+set_runtime_api_key(st.session_state.user_api_key)
+
 
 def set_pending_question(text: str) -> None:
     """Callback for example-prompt buttons."""
@@ -134,6 +141,16 @@ def set_pending_question(text: str) -> None:
 def clear_chat() -> None:
     """Callback for the clear-chat button."""
     st.session_state.messages = []
+
+def apply_user_key() -> None:
+    """Callback: store the key typed in the sidebar for this session only."""
+    st.session_state.user_api_key = st.session_state.api_key_input.strip() or None
+    st.session_state.api_key_input = ""
+
+
+def remove_user_key() -> None:
+    """Callback: forget the key entered in the sidebar."""
+    st.session_state.user_api_key = None
 
 
 # ---------- UI helpers ----------
@@ -249,7 +266,7 @@ with st.sidebar:
 
     st.markdown("---")
     if not api_ok:
-        render_status_pill("error", "API key missing")
+        render_status_pill("error", "API key missing: add one below")
     elif documents:
         render_status_pill("ready", "Ready to chat")
     else:
@@ -273,6 +290,25 @@ with st.sidebar:
         disabled=not st.session_state.messages,
         width="stretch",
     )
+
+    with st.expander("🔑 Use your own API key"):
+        st.caption(
+            "Get a free key from Google AI Studio. It is kept only in this "
+            "browser session and is never saved to disk."
+        )
+        if st.session_state.user_api_key:
+            st.success("Using your key for this session.")
+            st.button("Remove key", on_click=remove_user_key, width="stretch")
+        else:
+            st.text_input(
+                "Gemini API key",
+                type="password",
+                key="api_key_input",
+                label_visibility="collapsed",
+                placeholder="Paste your Gemini API key",
+            )
+            st.button("Use this key", on_click=apply_user_key, width="stretch")
+
 
 # ---------- Main area: header ----------
 st.markdown(

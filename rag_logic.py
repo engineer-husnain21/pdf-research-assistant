@@ -1,5 +1,6 @@
 """Core RAG logic: PDF ingestion, ChromaDB storage and conversational QA."""
 
+import contextvars
 import hashlib
 import os
 from pathlib import Path
@@ -54,13 +55,27 @@ class LLMUnavailableError(Exception):
 
 
 # ---------- Helpers ----------
-def get_api_key() -> str:
-    """Read the Google API key from environment variables."""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key or api_key.startswith("your_"):
-        raise ConfigError("GOOGLE_API_KEY not found. Add it to your .env file.")
-    return api_key
+# Per-session key supplied through the UI. A ContextVar keeps each Streamlit
+# user session isolated, so one visitor's key is never used for another.
+_runtime_api_key: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "runtime_api_key", default=None
+)
 
+
+def set_runtime_api_key(key: str | None) -> None:
+    """Set (or clear) an API key that overrides the one from .env."""
+    _runtime_api_key.set(key.strip() if key else None)
+
+
+def get_api_key() -> str:
+    """Return the UI-provided key if present, otherwise the one from .env."""
+    api_key = _runtime_api_key.get() or os.getenv("GOOGLE_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        raise ConfigError(
+            "No API key found. Add GOOGLE_API_KEY to your .env file "
+            "or paste a key in the sidebar."
+        )
+    return api_key
 
 def compute_file_hash(file_path: str) -> str:
     """Return the SHA-256 hash of a file (used to avoid duplicate ingestion)."""
