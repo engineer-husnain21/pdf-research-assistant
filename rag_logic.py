@@ -1,4 +1,4 @@
-"""Core RAG logic: PDF loading, chunking, embeddings and ChromaDB storage."""
+"""Core RAG logic: PDF ingestion, ChromaDB storage and conversational QA."""
 
 import hashlib
 import os
@@ -24,6 +24,13 @@ CHUNK_OVERLAP = 200
 EMBED_BATCH_SIZE = 50
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
+CONDENSE_MODEL = "gemini-3.1-flash-lite"
+FALLBACK_CHAT_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+]
 TOP_K = 4
 MAX_HISTORY_MESSAGES = 8
 FALLBACK_ANSWER = (
@@ -40,6 +47,10 @@ class ConfigError(Exception):
 
 class PDFProcessingError(Exception):
     """Raised when a PDF is empty, corrupt, or has no extractable text."""
+
+
+class LLMUnavailableError(Exception):
+    """Raised when every configured chat model is out of quota or unavailable."""
 
 
 # ---------- Helpers ----------
@@ -155,7 +166,22 @@ def search_documents(query: str, k: int = 4) -> list[Document]:
     return get_vector_store().similarity_search(query, k=k)
 
 
-# ---------- Conversational Retrieval Chain ----------
+def has_documents() -> bool:
+    """Return True if at least one chunk exists in the vector database."""
+    return len(get_vector_store().get(limit=1)["ids"]) > 0
+
+
+def list_ingested_documents() -> dict[str, int]:
+    """Return {file name: chunk count} for everything stored in ChromaDB."""
+    data = get_vector_store().get(include=["metadatas"])
+    counts: dict[str, int] = {}
+    for meta in data["metadatas"] or []:
+        name = (meta or {}).get("source", "Unknown")
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+# ---------- Prompts ----------
 CONDENSE_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -189,20 +215,60 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 
-def get_llm() -> ChatGoogleGenerativeAI:
-    """Create the Gemini chat model client."""
+# ---------- LLM with automatic model fallback ----------
+def get_model_candidates() -> list[str]:
+    """Return chat models in priority order: .env choice first, then fallbacks."""
+    preferred = os.getenv("CHAT_MODEL", DEFAULT_CHAT_MODEL)
+    return list(dict.fromkeys([preferred, *FALLBACK_CHAT_MODELS]))
+
+
+def get_llm(model_name: str) -> ChatGoogleGenerativeAI:
+    """Create a Gemini chat client. Fails fast so fallbacks kick in quickly."""
     return ChatGoogleGenerativeAI(
-        model=os.getenv("CHAT_MODEL", DEFAULT_CHAT_MODEL),
+        model=model_name,
         google_api_key=get_api_key(),
         temperature=0.2,
+        max_retries=1,
+        timeout=30,
     )
 
 
-def has_documents() -> bool:
-    """Return True if at least one chunk exists in the vector database."""
-    return len(get_vector_store().get(limit=1)["ids"]) > 0
+def _is_recoverable_llm_error(exc: Exception) -> bool:
+    """True for quota, overload and 'model not found' errors (try next model)."""
+    text = str(exc)
+    markers = (
+        "RESOURCE_EXHAUSTED",
+        "429",
+        "NOT_FOUND",
+        "404",
+        "UNAVAILABLE",
+        "503",
+        "overloaded",
+        "no longer available",
+    )
+    return any(marker in text for marker in markers)
 
 
+def _invoke_with_fallback(prompt, inputs: dict, models: list[str]) -> str:
+    """Run a prompt on each model in turn until one succeeds."""
+    last_error: Exception | None = None
+    for model_name in models:
+        try:
+            chain = prompt | get_llm(model_name) | StrOutputParser()
+            return chain.invoke(inputs).strip()
+        except ConfigError:
+            raise
+        except Exception as exc:
+            if _is_recoverable_llm_error(exc):
+                last_error = exc
+                continue
+            raise
+    raise LLMUnavailableError(
+        "All chat models are currently out of quota or unavailable."
+    ) from last_error
+
+
+# ---------- Conversational Retrieval ----------
 def to_langchain_history(messages: list[dict]) -> list[BaseMessage]:
     """Convert UI messages ({'role', 'content'}) to LangChain messages.
 
@@ -236,28 +302,58 @@ def format_sources(docs: list[Document]) -> list[dict]:
     return sources
 
 
+def build_passages_answer(docs: list[Document]) -> str:
+    """Fallback answer made from raw retrieved passages (no LLM needed)."""
+    lines = [
+        "The AI answer service is at its usage limit right now, so here are "
+        "the most relevant passages from your documents:\n"
+    ]
+    for src in format_sources(docs)[:3]:
+        lines.append(f"- **Page {src['page']}** ({src['source']}): {src['snippet']}…")
+    return "\n".join(lines)
+
+
 def answer_question(question: str, chat_history: list[dict] | None = None) -> dict:
     """Answer a question using the PDFs, with conversation memory.
 
-    Returns a dict: {"answer": str, "sources": list[dict], "found": bool}.
+    Returns: {"answer": str, "sources": list[dict], "found": bool, "degraded": bool}.
+    "degraded" is True when the LLM was unavailable and raw passages were returned.
     """
     if not has_documents():
-        return {"answer": NO_DOCUMENTS_ANSWER, "sources": [], "found": False}
+        return {
+            "answer": NO_DOCUMENTS_ANSWER,
+            "sources": [],
+            "found": False,
+            "degraded": False,
+        }
 
-    llm = get_llm()
     history = to_langchain_history(chat_history or [])
 
     # Step 1: turn a follow-up question into a standalone question
     standalone = question
     if history:
-        standalone = (CONDENSE_PROMPT | llm | StrOutputParser()).invoke(
-            {"chat_history": history, "question": question}
-        ).strip() or question
+        condense_models = list(dict.fromkeys([CONDENSE_MODEL, *get_model_candidates()]))
+        try:
+            standalone = (
+                _invoke_with_fallback(
+                    CONDENSE_PROMPT,
+                    {"chat_history": history, "question": question},
+                    condense_models,
+                )
+                or question
+            )
+        except LLMUnavailableError:
+            standalone = question  # still try retrieval with the raw question
 
     # Step 2: retrieve relevant chunks
     docs = search_documents(standalone, k=TOP_K)
     if not docs:
-        return {"answer": FALLBACK_ANSWER, "sources": [], "found": False}
+        return {
+            "answer": FALLBACK_ANSWER,
+            "sources": [],
+            "found": False,
+            "degraded": False,
+        }
 
     context = "\n\n".join(
         f"[{d.metadata.get('source', 'Unknown')}, page "
@@ -265,24 +361,25 @@ def answer_question(question: str, chat_history: list[dict] | None = None) -> di
         for d in docs
     )
 
-    # Step 3: generate the grounded answer
-    answer = (ANSWER_PROMPT | llm | StrOutputParser()).invoke(
-        {"context": context, "chat_history": history, "question": question}
-    ).strip()
+    # Step 3: generate the grounded answer (or degrade to raw passages)
+    try:
+        answer = _invoke_with_fallback(
+            ANSWER_PROMPT,
+            {"context": context, "chat_history": history, "question": question},
+            get_model_candidates(),
+        )
+    except LLMUnavailableError:
+        return {
+            "answer": build_passages_answer(docs),
+            "sources": format_sources(docs),
+            "found": True,
+            "degraded": True,
+        }
 
     found = FALLBACK_ANSWER not in answer
     return {
         "answer": answer,
         "sources": format_sources(docs) if found else [],
         "found": found,
+        "degraded": False,
     }
-
-
-def list_ingested_documents() -> dict[str, int]:
-    """Return {file name: chunk count} for everything stored in ChromaDB."""
-    data = get_vector_store().get(include=["metadatas"])
-    counts: dict[str, int] = {}
-    for meta in data["metadatas"] or []:
-        name = (meta or {}).get("source", "Unknown")
-        counts[name] = counts.get(name, 0) + 1
-    return counts
