@@ -8,7 +8,10 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
@@ -20,6 +23,14 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 EMBED_BATCH_SIZE = 50
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
+DEFAULT_CHAT_MODEL = "gemini-2.5-flash"
+TOP_K = 4
+MAX_HISTORY_MESSAGES = 8
+FALLBACK_ANSWER = (
+    "I couldn't find this in the uploaded documents. "
+    "Try rephrasing your question or upload a PDF that covers this topic."
+)
+NO_DOCUMENTS_ANSWER = "Please upload and process a PDF first, then ask your question."
 
 
 # ---------- Custom errors ----------
@@ -142,3 +153,123 @@ def ingest_pdf(file_path: str, display_name: str | None = None) -> dict:
 def search_documents(query: str, k: int = 4) -> list[Document]:
     """Return the top-k most similar chunks for a query."""
     return get_vector_store().similarity_search(query, k=k)
+
+
+# ---------- Conversational Retrieval Chain ----------
+CONDENSE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Given the chat history and the latest user question, rewrite the "
+            "question so it can be understood without the history. Do NOT answer "
+            "it. If it is already standalone, return it unchanged.",
+        ),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{question}"),
+    ]
+)
+
+ANSWER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a careful research assistant. Answer the question using ONLY "
+            "the context below, which comes from the user's PDF documents. "
+            "Be clear and concise, and use short bullet points when helpful. "
+            "If the context does not contain the answer, reply with exactly this "
+            f"sentence and nothing else: {FALLBACK_ANSWER}\n\n"
+            "Context:\n{context}",
+        ),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{question}"),
+    ]
+)
+
+
+def get_llm() -> ChatGoogleGenerativeAI:
+    """Create the Gemini chat model client."""
+    return ChatGoogleGenerativeAI(
+        model=os.getenv("CHAT_MODEL", DEFAULT_CHAT_MODEL),
+        google_api_key=get_api_key(),
+        temperature=0.2,
+    )
+
+
+def has_documents() -> bool:
+    """Return True if at least one chunk exists in the vector database."""
+    return len(get_vector_store().get(limit=1)["ids"]) > 0
+
+
+def to_langchain_history(messages: list[dict]) -> list[BaseMessage]:
+    """Convert UI messages ({'role', 'content'}) to LangChain messages.
+
+    Only the most recent messages are kept to control token usage.
+    """
+    history: list[BaseMessage] = []
+    for msg in messages[-MAX_HISTORY_MESSAGES:]:
+        if msg["role"] == "user":
+            history.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            history.append(AIMessage(content=msg["content"]))
+    return history
+
+
+def format_sources(docs: list[Document]) -> list[dict]:
+    """Build a de-duplicated list of source info for the UI."""
+    sources, seen = [], set()
+    for doc in docs:
+        name = doc.metadata.get("source", "Unknown")
+        page = int(doc.metadata.get("page", 0)) + 1  # PyPDF pages start at 0
+        if (name, page) in seen:
+            continue
+        seen.add((name, page))
+        sources.append(
+            {
+                "source": name,
+                "page": page,
+                "snippet": " ".join(doc.page_content.split())[:220],
+            }
+        )
+    return sources
+
+
+def answer_question(question: str, chat_history: list[dict] | None = None) -> dict:
+    """Answer a question using the PDFs, with conversation memory.
+
+    Returns a dict: {"answer": str, "sources": list[dict], "found": bool}.
+    """
+    if not has_documents():
+        return {"answer": NO_DOCUMENTS_ANSWER, "sources": [], "found": False}
+
+    llm = get_llm()
+    history = to_langchain_history(chat_history or [])
+
+    # Step 1: turn a follow-up question into a standalone question
+    standalone = question
+    if history:
+        standalone = (CONDENSE_PROMPT | llm | StrOutputParser()).invoke(
+            {"chat_history": history, "question": question}
+        ).strip() or question
+
+    # Step 2: retrieve relevant chunks
+    docs = search_documents(standalone, k=TOP_K)
+    if not docs:
+        return {"answer": FALLBACK_ANSWER, "sources": [], "found": False}
+
+    context = "\n\n".join(
+        f"[{d.metadata.get('source', 'Unknown')}, page "
+        f"{int(d.metadata.get('page', 0)) + 1}]\n{d.page_content}"
+        for d in docs
+    )
+
+    # Step 3: generate the grounded answer
+    answer = (ANSWER_PROMPT | llm | StrOutputParser()).invoke(
+        {"context": context, "chat_history": history, "question": question}
+    ).strip()
+
+    found = FALLBACK_ANSWER not in answer
+    return {
+        "answer": answer,
+        "sources": format_sources(docs) if found else [],
+        "found": found,
+    }
