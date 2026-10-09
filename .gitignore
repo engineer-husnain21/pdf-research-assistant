@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Virtual environment
+venv/
+.venv/
+
+# Local vector DB and uploads
+chroma_db/
+uploads/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE / OS
+.vscode/
+.DS_Store
