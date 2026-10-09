@@ -105,6 +105,11 @@ section[data-testid="stSidebar"] {
     transform: translateY(-1px); border-color: #8B5CF6;
     box-shadow: 0 6px 20px rgba(139, 92, 246, 0.28);
 }
+.limited-badge {
+    display: inline-block; margin-bottom: 10px; padding: 4px 12px; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 600; color: #FCD34D;
+    background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35);
+}
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -138,6 +143,26 @@ def render_status_pill(kind: str, text: str) -> None:
         unsafe_allow_html=True,
     )
 
+
+def friendly_error(exc: Exception) -> str:
+    """Turn raw API errors into short, human-readable messages."""
+    text = str(exc)
+    lowered = text.lower()
+    if "RESOURCE_EXHAUSTED" in text or "429" in text:
+        return "The AI service has reached its free usage limit. Please try again in a little while."
+    if "API_KEY_INVALID" in text or "PERMISSION_DENIED" in text or "API key" in text:
+        return "The API key looks invalid. Please check GOOGLE_API_KEY in your .env file."
+    if "timed out" in lowered or "timeout" in lowered or "connect" in lowered:
+        return "Could not reach the AI service. Please check your internet connection and try again."
+    return "Something unexpected went wrong. Please try again."
+
+
+def render_limited_badge() -> None:
+    st.markdown(
+        '<span class="limited-badge">⚡ Limited mode: AI quota reached, '
+        "showing passages from your documents</span>",
+        unsafe_allow_html=True,
+    )
 
 def render_sources(sources: list[dict]) -> None:
     """Show source cards (file, page number, snippet) inside an expander."""
@@ -194,7 +219,7 @@ with st.sidebar:
                     st.write(f"❌ {exc}")
                     failed += 1
                 except Exception as exc:  # API / network problems
-                    st.write(f"❌ Could not process '{uploaded.name}': {exc}")
+                    st.write(f"❌ Could not process '{uploaded.name}': {friendly_error(exc)}")
                     failed += 1
                 else:
                     if result["status"] == "skipped":
@@ -269,6 +294,8 @@ if not prompt:
 for message in st.session_state.messages:
     avatar = "🧑" if message["role"] == "user" else "✨"
     with st.chat_message(message["role"], avatar=avatar):
+        if message.get("degraded"):
+            render_limited_badge()
         st.markdown(message["content"])
         if message["role"] == "assistant":
             render_sources(message.get("sources", []))
@@ -304,8 +331,10 @@ if prompt:
             st.error(f"Configuration error: {exc}")
         except Exception as exc:
             st.session_state.messages.pop()
-            st.error(f"Something went wrong while generating the answer: {exc}")
+            st.error(friendly_error(exc))
         else:
+            if result.get("degraded"):
+                render_limited_badge()
             st.markdown(result["answer"])
             render_sources(result["sources"])
             st.session_state.messages.append(
@@ -313,5 +342,6 @@ if prompt:
                     "role": "assistant",
                     "content": result["answer"],
                     "sources": result["sources"],
+                    "degraded": result.get("degraded", False),
                 }
             )

@@ -303,14 +303,14 @@ def format_sources(docs: list[Document]) -> list[dict]:
 
 
 def build_passages_answer(docs: list[Document]) -> str:
-    """Fallback answer made from raw retrieved passages (no LLM needed)."""
-    lines = [
-        "The AI answer service is at its usage limit right now, so here are "
-        "the most relevant passages from your documents:\n"
-    ]
-    for src in format_sources(docs)[:3]:
-        lines.append(f"- **Page {src['page']}** ({src['source']}): {src['snippet']}…")
-    return "\n".join(lines)
+    """Fallback answer used when no LLM is available (no API call needed)."""
+    sources = format_sources(docs)[:3]
+    pages = ", ".join(f"page {s['page']}" for s in sources)
+    return (
+        "I can't generate a written answer right now, but I found the most "
+        f"relevant passages in your documents ({pages}). "
+        "You can read them in the source cards below."
+    )
 
 
 def answer_question(question: str, chat_history: list[dict] | None = None) -> dict:
