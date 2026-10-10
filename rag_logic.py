@@ -160,7 +160,11 @@ def ingest_pdf(file_path: str, display_name: str | None = None) -> dict:
     if is_already_ingested(vector_store, file_hash):
         return {"file": name, "status": "skipped", "chunks": 0}
 
-    pages = load_pdf(file_path)
+    try:
+        pages = load_pdf(file_path)
+    except PDFProcessingError as exc:
+        # Show the user's real file name instead of the temporary one
+        raise PDFProcessingError(str(exc).replace(Path(file_path).name, name)) from exc
     chunks = split_documents(pages)
 
     for chunk in chunks:
