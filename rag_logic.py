@@ -449,7 +449,7 @@ def answer_question(question: str, chat_history: list[dict] | None = None) -> di
     except LLMUnavailableError:
         return {
             "answer": build_passages_answer(docs),
-            "sources": format_sources(docs, standalone) if found else [],
+            "sources": format_sources(docs, standalone),
             "found": True,
             "degraded": True,
         }
