@@ -3,6 +3,7 @@
 import contextvars
 import hashlib
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -22,7 +23,10 @@ CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "pdf_research"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-EMBED_BATCH_SIZE = 50
+EMBED_BATCH_SIZE = 20
+BATCH_PAUSE_SECONDS = 12
+MAX_EMBED_RETRIES = 4
+RETRY_WAIT_SECONDS = 40
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
 CONDENSE_MODEL = "gemini-3.1-flash-lite"
@@ -163,9 +167,25 @@ def ingest_pdf(file_path: str, display_name: str | None = None) -> dict:
         chunk.metadata["source"] = name
         chunk.metadata["file_hash"] = file_hash
 
-    # Add in batches to stay within API limits
-    for i in range(0, len(chunks), EMBED_BATCH_SIZE):
-        vector_store.add_documents(chunks[i : i + EMBED_BATCH_SIZE])
+    # Add in small batches with pauses; clean up if the upload fails midway
+    try:
+        for start in range(0, len(chunks), EMBED_BATCH_SIZE):
+            batch = chunks[start : start + EMBED_BATCH_SIZE]
+            for attempt in range(MAX_EMBED_RETRIES + 1):
+                try:
+                    vector_store.add_documents(batch)
+                    break
+                except Exception as exc:
+                    quota_hit = "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+                    if not quota_hit or attempt == MAX_EMBED_RETRIES:
+                        raise
+                    time.sleep(RETRY_WAIT_SECONDS)
+            if start + EMBED_BATCH_SIZE < len(chunks):
+                time.sleep(BATCH_PAUSE_SECONDS)
+    except Exception:
+        # Remove the partial upload so the file can be processed again cleanly
+        vector_store.delete(where={"file_hash": file_hash})
+        raise
 
     return {
         "file": name,
@@ -175,11 +195,29 @@ def ingest_pdf(file_path: str, display_name: str | None = None) -> dict:
     }
 
 
-# ---------- Retrieval ----------
-def search_documents(query: str, k: int = 4) -> list[Document]:
-    """Return the top-k most similar chunks for a query."""
-    return get_vector_store().similarity_search(query, k=k)
+CANDIDATE_POOL = 30
+RERANK_STOPWORDS = {
+    "what", "who", "when", "where", "which", "that", "this", "with", "from",
+    "have", "been", "were", "about", "does", "give", "gave", "tell", "into",
+    "their", "there", "these", "those", "would", "could", "should",
+}
 
+
+def search_documents(query: str, k: int = 4) -> list[Document]:
+    """Return the top-k chunks, re-ranked by how many query keywords they contain."""
+    candidates = get_vector_store().similarity_search(query, k=max(k, CANDIDATE_POOL))
+
+    terms = [w.strip("?.,!:;'\"()").lower() for w in query.split()]
+    terms = [w for w in terms if len(w) > 3 and w not in RERANK_STOPWORDS]
+
+    def sort_key(item):
+        position, doc = item
+        text = doc.page_content.lower()
+        matches = sum(1 for term in terms if term in text)
+        return (-matches, position)  # more keyword matches first, then original order
+
+    ranked = sorted(enumerate(candidates), key=sort_key)
+    return [doc for _, doc in ranked[:k]]
 
 def has_documents() -> bool:
     """Return True if at least one chunk exists in the vector database."""
@@ -298,7 +336,28 @@ def to_langchain_history(messages: list[dict]) -> list[BaseMessage]:
     return history
 
 
-def format_sources(docs: list[Document]) -> list[dict]:
+SNIPPET_STOPWORDS = {
+    "what", "who", "when", "where", "which", "that", "this", "with", "from",
+    "have", "been", "were", "about", "does", "give", "gave", "tell", "into",
+}
+
+
+def _best_snippet(text: str, query: str | None, size: int = 380) -> str:
+    """Return a text window around the first query keyword found in the chunk."""
+    flat = " ".join(text.split())
+    start = 0
+    if query:
+        words = [w.strip("?.,!'\"").lower() for w in query.split()]
+        words = [w for w in words if len(w) > 3 and w not in SNIPPET_STOPWORDS]
+        lowered = flat.lower()
+        hits = [lowered.find(w) for w in words if lowered.find(w) != -1]
+        if hits:
+            start = max(0, min(hits) - 100)
+    prefix = "…" if start > 0 else ""
+    return prefix + flat[start : start + size]
+
+
+def format_sources(docs: list[Document], query: str | None = None) -> list[dict]:
     """Build a de-duplicated list of source info for the UI."""
     sources, seen = [], set()
     for doc in docs:
@@ -311,7 +370,7 @@ def format_sources(docs: list[Document]) -> list[dict]:
             {
                 "source": name,
                 "page": page,
-                "snippet": " ".join(doc.page_content.split())[:220],
+                "snippet": _best_snippet(doc.page_content, query),
             }
         )
     return sources
@@ -386,7 +445,7 @@ def answer_question(question: str, chat_history: list[dict] | None = None) -> di
     except LLMUnavailableError:
         return {
             "answer": build_passages_answer(docs),
-            "sources": format_sources(docs),
+            "sources": format_sources(docs, standalone) if found else [],
             "found": True,
             "degraded": True,
         }
@@ -394,7 +453,7 @@ def answer_question(question: str, chat_history: list[dict] | None = None) -> di
     found = FALLBACK_ANSWER not in answer
     return {
         "answer": answer,
-        "sources": format_sources(docs) if found else [],
+        "sources": format_sources(docs, standalone) if found else [],
         "found": found,
         "degraded": False,
     }
