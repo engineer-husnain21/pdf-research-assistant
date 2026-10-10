@@ -8,6 +8,7 @@ venv/
 # Local vector DB and uploads
 chroma_db/
 uploads/
+*.pdf
 
 # Python
 __pycache__/
